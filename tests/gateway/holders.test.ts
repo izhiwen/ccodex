@@ -40,21 +40,38 @@ describe("ccodex/thread/holders", () => {
 });
 
 describe("resumeWarnings", () => {
-  it("attributes only warnings naming the chat after the resume, bounded, and counts the rest", async () => {
+  it("counts warnings naming the chat after the resume by method, shows no text, and counts the rest apart", async () => {
     const { resumeWarnings } = await import("../../src/mcp/gatewayReply.js");
     const messages = [
       { method: "warning", params: { threadId: "T", message: "before" } },
       { method: "warning", params: { message: "no id" } },
       { method: "warning", params: { threadId: "U", message: "other chat" } },
-      ...[1, 2, 3, 4].map((n) => ({ method: "warning", params: { threadId: "T", message: `w${n} ${"x".repeat(300)}` } })),
+      { method: "warning", params: { threadId: "T", message: "token=SENTINEL-SECRET https://x.test/?key=SENTINEL-KEY" } },
+      { method: "configWarning", params: { threadId: "T", summary: "SENTINEL-SUMMARY" } },
     ];
     const text = resumeWarnings(messages, "T", 1);
-    expect(text).not.toContain("before");
-    expect(text).not.toContain("no id");
-    expect(text).not.toContain("other chat");
-    expect(text.match(/warning: w\d/g)).toHaveLength(3);
-    expect(text).toContain("(+1 more)");
-    expect(text).toContain("2 warning(s) without this chat's id");
-    expect(text).not.toContain("x".repeat(161));
+    expect(text).toBe("warnings naming this chat after the resume: warning×1, configWarning×1 (text not shown); 2 other warning(s) not naming this chat");
+    expect(text).not.toMatch(/SENTINEL|before|no id|other chat/);
+  });
+});
+
+describe("checkHoldersAnswer", () => {
+  it("accepts only an answer for the asked chat, in the gateway scope, with well-formed items", async () => {
+    const { checkHoldersAnswer } = await import("../../src/mcp/gatewayReply.js");
+    const item = { connectionId: "c", clientName: "codex_desktop", openedAt: "2026-10-19T00:00:00.000Z", self: false };
+    expect(checkHoldersAnswer({ threadId: "T", scope: "gateway", connections: [item] }, "T")).toEqual({ holders: [{ clientName: "codex_desktop", openedAt: item.openedAt }] });
+    for (const [answer, reason] of [
+      [{ threadId: "U", scope: "gateway", connections: [] }, "threadId differs"],
+      [{ threadId: "T", connections: [] }, "scope"],
+      [{ threadId: "T", scope: "gateway", connections: [123] }, "connections[0] is not an object"],
+      [{ threadId: "T", scope: "gateway", connections: [{ ...item, self: "no" }] }, "self"],
+      [{ threadId: "T", scope: "gateway", connections: [{ ...item, openedAt: "SENTINEL" }] }, "openedAt"],
+    ] as const) {
+      const checked = checkHoldersAnswer(answer, "T") as { malformed?: string };
+      expect(checked.malformed).toContain(reason);
+      expect(checked.malformed).not.toContain("SENTINEL");
+    }
+    const odd = checkHoldersAnswer({ threadId: "T", scope: "gateway", connections: [{ ...item, clientName: "x SENTINEL token=1" }] }, "T") as any;
+    expect(odd.holders[0].clientName).toBeNull();
   });
 });

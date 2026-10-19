@@ -1,7 +1,6 @@
 import { createConnection } from "node:net";
 import WebSocket from "ws";
 import { realpathSync } from "node:fs";
-import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 
 type Message = Record<string, any>;
@@ -163,54 +162,70 @@ export async function archiveViaGateway(socketPath: string, threadIds: string[])
   return archived;
 }
 
-const WARNING_METHODS = new Set(["warning", "configWarning", "guardianWarning"]);
-const WARNING_LIMIT = 3;
-const WARNING_CHARS = 160;
+const WARNING_METHODS = ["warning", "configWarning", "guardianWarning"] as const;
 const HOLDERS_WAIT_MS = 5_000;
+const HOLDERS_SHOWN = 10;
+/** A client name is shown only when it looks like one (clients name themselves; it is not an identity). */
+const CLIENT_NAME = /^[A-Za-z0-9_.:-]{1,64}$/u;
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u;
 
-/** A bounded, single-line excerpt with the home directory shortened: diagnostics, not a transcript. */
-function excerpt(text: unknown, chars = WARNING_CHARS): string {
-  const flat = String(text ?? "").replace(/[\u0000-\u001f\u007f]+/gu, " ").replaceAll(homedir(), "~").trim();
-  return flat.length > chars ? `${flat.slice(0, chars)}…` : flat;
-}
-
-/** Warnings stock sent for this chat after `from` (the resume): only those naming the chat count; others are counted. */
+/**
+ * Warnings stock sent after `from` (the resume), as counts by method only: a warning's text is free text that may
+ * carry anything, so none of it is shown. Only warnings naming this chat are attributed to it; the rest are counted
+ * apart. Arriving after the resume does not make a warning caused by it.
+ */
 export function resumeWarnings(messages: Message[], threadId: string, from: number): string {
-  const warnings = messages.slice(from).filter((message) => WARNING_METHODS.has(String(message.method)));
+  const warnings = messages.slice(from).filter((message) => (WARNING_METHODS as readonly string[]).includes(String(message.method)));
   const own = warnings.filter((message) => message.params?.threadId === threadId);
+  const counts = WARNING_METHODS.map((method) => [method, own.filter((message) => message.method === method).length] as const)
+    .filter(([, count]) => count > 0).map(([method, count]) => `${method}×${count}`);
   const unattributed = warnings.length - own.length;
-  const shown = own.slice(0, WARNING_LIMIT)
-    .map((message) => `${message.method}: ${excerpt(message.params?.message ?? message.params?.summary)}`);
-  const more = own.length > WARNING_LIMIT ? ` (+${own.length - WARNING_LIMIT} more)` : "";
-  const others = unattributed ? `; ${unattributed} warning(s) without this chat's id, not attributed to it` : "";
-  return `warning excerpts for this chat after the resume: ${shown.length ? shown.join(" | ") : "none"}${more}${others}`;
+  return `warnings naming this chat after the resume: ${counts.length ? counts.join(", ") : "none"} (text not shown)`
+    + (unattributed ? `; ${unattributed} other warning(s) not naming this chat` : "");
 }
 
+export type Holder = { clientName: string | null; openedAt: string | null };
 export type HoldersOutcome =
-  | { outcome: "ok"; connections: Array<{ clientName: string | null; openedAt: string | null }> }
+  | { outcome: "ok"; connections: Holder[]; omitted: number }
   | { outcome: "unsupported" | "timeout" | "closed" | "malformed" | "error"; detail: string };
+
+/** Checks an answer of `ccodex/thread/holders` against what was asked; the reason names a field, never its content. */
+export function checkHoldersAnswer(found: unknown, threadId: string): { holders: Holder[] } | { malformed: string } {
+  if (!found || typeof found !== "object" || Array.isArray(found)) return { malformed: "answer is not an object" };
+  const answer = found as Message;
+  if (answer.threadId !== threadId) return { malformed: "threadId differs from the one asked" };
+  if (answer.scope !== "gateway") return { malformed: "scope is not \"gateway\"" };
+  if (!Array.isArray(answer.connections)) return { malformed: "connections is not an array" };
+  const holders: Holder[] = [];
+  for (const [index, item] of answer.connections.entries()) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return { malformed: `connections[${index}] is not an object` };
+    if (typeof item.self !== "boolean") return { malformed: `connections[${index}].self is not a boolean` };
+    if (typeof item.connectionId !== "string") return { malformed: `connections[${index}].connectionId is not a string` };
+    if (item.clientName !== null && typeof item.clientName !== "string") return { malformed: `connections[${index}].clientName is not a string or null` };
+    if (typeof item.openedAt !== "string" || !ISO_TIME.test(item.openedAt)) return { malformed: `connections[${index}].openedAt is not a UTC timestamp` };
+    if (item.self) continue;
+    holders.push({ clientName: typeof item.clientName === "string" && CLIENT_NAME.test(item.clientName) ? item.clientName : null, openedAt: item.openedAt });
+  }
+  return { holders };
+}
 
 /** The gateway's connected clients holding a stock chat, read-only (no resume, turn or unsubscribe). Failures are
  *  told apart only as far as the answer shows: an explicit method-not-found, no answer in time, a closed
- *  connection, an answer of the wrong shape, or another error (its code and a bounded message, cause unknown). */
+ *  connection, an answer that does not match the request, or another error (its code only; cause unknown). */
 export async function queryHolders(gateway: Gateway, threadId: string, waitMs = HOLDERS_WAIT_MS): Promise<HoldersOutcome> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(Object.assign(new Error("no answer"), { kind: "timeout" })), waitMs);
   });
   try {
-    const found: Message = await Promise.race([gateway.request("ccodex/thread/holders", { threadId }), timeout]);
-    if (!found || !Array.isArray(found.connections)) return { outcome: "malformed", detail: excerpt(JSON.stringify(found ?? null)) };
-    return {
-      outcome: "ok",
-      connections: found.connections.filter((holder: Message) => holder && !holder.self)
-        .map((holder: Message) => ({ clientName: typeof holder.clientName === "string" ? holder.clientName : null, openedAt: typeof holder.openedAt === "string" ? holder.openedAt : null })),
-    };
+    const checked = checkHoldersAnswer(await Promise.race([gateway.request("ccodex/thread/holders", { threadId }), timeout]), threadId);
+    if ("malformed" in checked) return { outcome: "malformed", detail: checked.malformed };
+    return { outcome: "ok", connections: checked.holders.slice(0, HOLDERS_SHOWN), omitted: Math.max(0, checked.holders.length - HOLDERS_SHOWN) };
   } catch (error: any) {
     if (error?.kind === "timeout") return { outcome: "timeout", detail: `no answer within ${waitMs} ms` };
     if (gateway.isClosed()) return { outcome: "closed", detail: "the gateway closed the connection" };
-    if (error?.code === -32601) return { outcome: "unsupported", detail: "method not found" };
-    return { outcome: "error", detail: `code ${error?.code ?? "none"}: ${excerpt(error?.message)}` };
+    if (error?.code === -32601) return { outcome: "unsupported", detail: "method not found (-32601)" };
+    return { outcome: "error", detail: `code ${Number.isInteger(error?.code) ? error.code : "none"} (message not shown)` };
   } finally {
     clearTimeout(timer);
   }
@@ -219,7 +234,8 @@ export async function queryHolders(gateway: Gateway, threadId: string, waitMs = 
 export function describeHolders(found: HoldersOutcome): string {
   if (found.outcome === "ok") {
     const names = found.connections.map((holder) => `${holder.clientName ?? "unnamed"} (connected ${holder.openedAt ?? "unknown"})`);
-    return `gateway clients holding the chat: ${names.length ? names.join(", ") : "none known to the gateway"} (subscribers outside the gateway are not visible)`;
+    const more = found.omitted ? ` and ${found.omitted} more` : "";
+    return `gateway clients holding the chat: ${names.length ? names.join(", ") + more : "none known to the gateway"} (subscribers outside the gateway are not visible)`;
   }
   return `gateway clients holding the chat: not known (${found.outcome}: ${found.detail})`;
 }
@@ -240,8 +256,10 @@ async function resolveChat(request: Gateway["request"], chat: string): Promise<s
 
 /**
  * Read-only diagnostics of a chat through the gateway: its stored cwd, status and model (`thread/read` without turns),
- * whether it is loaded, and the gateway's connected clients holding it. Nothing resumes, starts, steers or unsubscribes
- * the chat. Stock's own subscribers outside the gateway are not visible, and why stock keeps a directory is not known.
+ * whether it is loaded, and the gateway's connected clients holding it. Requests: `initialize`, `thread/list` (only
+ * for a title; of several chats of the title it takes the one used last, so pass the exact id), `thread/read`,
+ * `thread/loaded/list` and `ccodex/thread/holders`. Nothing resumes, starts, steers or unsubscribes the chat; the
+ * tool opens and closes its own connection only. Stock's own subscribers outside the gateway are not visible, and why stock keeps a directory is not known.
  */
 export async function holdersViaGateway(socketPath: string, chat: string, waitMs = HOLDERS_WAIT_MS): Promise<Message> {
   const gateway = await connectGateway(socketPath);
