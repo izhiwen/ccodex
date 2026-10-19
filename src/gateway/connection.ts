@@ -23,6 +23,8 @@ type Handler = (connection: Connection, params: any) => Promise<unknown>;
  */
 export class Connection {
   public readonly id = randomUUID();
+  /** When this client connected (diagnostics only). */
+  public readonly openedAt = new Date().toISOString();
   public clientName?: string;
   /** Provider of the thread this client last worked in (rate limits follow it). */
   public provider: Provider = "codex";

@@ -300,6 +300,19 @@ export class Gateway {
       }
       return result;
     });
+    // Read-only diagnostics: which of the gateway's connected clients hold a stock thread. Nothing is sent to stock and
+    // no subscription changes.
+    on("ccodex/thread/holders", async (connection, params) => {
+      const threadId = typeof params?.threadId === "string" ? params.threadId : "";
+      if (!threadId) throw invalidRequest("ccodex/thread/holders needs a threadId.");
+      return {
+        threadId,
+        scope: "gateway",
+        connections: this.lineages.holders(threadId).map((holder) => ({
+          connectionId: holder.id, clientName: holder.clientName ?? null, openedAt: holder.openedAt, self: holder === connection,
+        })),
+      };
+    });
     on("thread/list", (connection, params) => this.catalog.list(connection, params));
     on("thread/search", (connection, params) => this.catalog.search(connection, params));
     on("thread/loaded/list", (connection, params) => this.catalog.loaded(connection, params));

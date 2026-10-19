@@ -167,6 +167,24 @@ export async function archiveViaGateway(socketPath: string, threadIds: string[])
  * active writer, which `codex exec resume` cannot take), a busy chat (the prompt joins its running turn) and a chat
  * now on a Claude model (the gateway routes it to the Claude session) all get it. `chat` is a thread id or a title.
  */
+/** What the gateway can tell about a kept cwd, read-only: stock's warnings during the resume and the gateway's own
+ *  clients that hold the chat. Neither is exhaustive: stock does not say why, and its other subscribers are unknown. */
+async function cwdDiagnostics(gateway: Gateway, threadId: string): Promise<string> {
+  const warnings = gateway.messages
+    .filter((message) => ["warning", "configWarning", "guardianWarning"].includes(String(message.method))
+      && (message.params?.threadId === undefined || message.params.threadId === threadId))
+    .map((message) => `${message.method}: ${message.params?.message ?? message.params?.summary ?? ""}`.trim());
+  let holders: string;
+  try {
+    const found: Message = await gateway.request("ccodex/thread/holders", { threadId });
+    const others = (found.connections ?? []).filter((holder: Message) => !holder.self);
+    holders = `gateway clients holding the chat: ${others.length ? others.map((holder: Message) => `${holder.clientName ?? "unnamed"} (connected ${holder.openedAt})`).join(", ") : "none"} (subscribers outside the gateway are not visible)`;
+  } catch {
+    holders = "gateway clients holding the chat: unknown (this gateway has no ccodex/thread/holders)";
+  }
+  return `Stock warnings during the resume: ${warnings.length ? warnings.join("; ") : "none"}. ${holders}.`;
+}
+
 function sameDir(actual: unknown, wanted: string): boolean {
   if (typeof actual !== "string") return false;
   const real = (path: string) => { try { return realpathSync(path); } catch { return resolvePath(path); } };
@@ -198,7 +216,8 @@ export async function replyViaGateway(socketPath: string, chat: string, prompt: 
     // move the turns without the MCP servers, so it is not sent: the message is held back instead.
     if (options.cwd && !sameDir(resumed.cwd ?? resumed.thread?.cwd, options.cwd)) {
       const kept = resumed.cwd ?? resumed.thread?.cwd ?? "its own directory";
-      const facts = `[CCodex: requested cwd ${options.cwd}; chat reports cwd ${kept}; model ${resumed.model ?? "unknown"}; status ${resumed.thread?.status?.type ?? "unknown"}.]`;
+      const facts = `[CCodex: requested cwd ${options.cwd}; chat reports cwd ${kept}; model ${resumed.model ?? "unknown"}; status ${resumed.thread?.status?.type ?? "unknown"}.`
+        + ` ${await cwdDiagnostics(gateway, threadId)}]`;
       throw new Error(String(resumed.model ?? "").startsWith("claude")
         ? `Not sent: Claude chats cannot move to another directory, so the chat stays in ${kept}. ${facts}`
         // Observed, not exhaustive: a client still subscribed to the chat makes stock keep its directory; stock's reasons

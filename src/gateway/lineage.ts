@@ -99,6 +99,12 @@ export class Lineages {
 
   public constructor(private readonly gateway: Gateway) {}
 
+  /** Connected clients whose requests on this stock thread the gateway has seen subscribe them (a resume or a turn)
+   *  without a later unsubscribe. Only the gateway's own clients: stock's other subscribers are not known here. */
+  public holders(threadId: string): Connection[] {
+    return [...this.gateway.connections].filter((connection) => this.resumed.get(connection)?.has(threadId));
+  }
+
   private segments(threadId: string): Segment[] {
     return [...this.gateway.meta.lineage(threadId)
       ?? [{ provider: this.gateway.claude.owns(threadId) ? "claude" : "codex", threadId, lastTurnId: null }]];
