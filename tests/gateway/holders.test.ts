@@ -38,3 +38,23 @@ describe("ccodex/thread/holders", () => {
       .rejects.toThrow(/gateway clients holding the chat: codex_desktop/);
   });
 });
+
+describe("resumeWarnings", () => {
+  it("attributes only warnings naming the chat after the resume, bounded, and counts the rest", async () => {
+    const { resumeWarnings } = await import("../../src/mcp/gatewayReply.js");
+    const messages = [
+      { method: "warning", params: { threadId: "T", message: "before" } },
+      { method: "warning", params: { message: "no id" } },
+      { method: "warning", params: { threadId: "U", message: "other chat" } },
+      ...[1, 2, 3, 4].map((n) => ({ method: "warning", params: { threadId: "T", message: `w${n} ${"x".repeat(300)}` } })),
+    ];
+    const text = resumeWarnings(messages, "T", 1);
+    expect(text).not.toContain("before");
+    expect(text).not.toContain("no id");
+    expect(text).not.toContain("other chat");
+    expect(text.match(/warning: w\d/g)).toHaveLength(3);
+    expect(text).toContain("(+1 more)");
+    expect(text).toContain("2 warning(s) without this chat's id");
+    expect(text).not.toContain("x".repeat(161));
+  });
+});

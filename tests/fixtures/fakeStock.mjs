@@ -2,7 +2,7 @@
 // Minimal scripted `codex app-server --listen unix://…`: in-memory threads, the notifications stock sends, and a
 // few test hooks. Enough to exercise CCodex's gateway as a black box.
 import { randomUUID } from "node:crypto";
-import { existsSync, renameSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
@@ -263,6 +263,8 @@ sockets.on("connection", (socket) => {
       return;
     }
     if (message.id === undefined) return;
+    // Test hook: every request stock receives, one JSON line each (method and thread only).
+    if (process.env.FAKE_STOCK_LOG) appendFileSync(process.env.FAKE_STOCK_LOG, `${JSON.stringify({ method: message.method, threadId: message.params?.threadId ?? null })}\n`);
     const handler = handlers[message.method];
     try {
       const result = handler ? await handler(connection, message.params ?? {}) : { echo: message.method, raw: text };

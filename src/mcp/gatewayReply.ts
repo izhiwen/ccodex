@@ -1,6 +1,7 @@
 import { createConnection } from "node:net";
 import WebSocket from "ws";
 import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 
 type Message = Record<string, any>;
@@ -162,27 +163,110 @@ export async function archiveViaGateway(socketPath: string, threadIds: string[])
   return archived;
 }
 
-/**
- * Sends a prompt to a chat through CCodex's own socket, as the Codex app does: a chat the app has open (it has an
- * active writer, which `codex exec resume` cannot take), a busy chat (the prompt joins its running turn) and a chat
- * now on a Claude model (the gateway routes it to the Claude session) all get it. `chat` is a thread id or a title.
- */
-/** What the gateway can tell about a kept cwd, read-only: stock's warnings during the resume and the gateway's own
- *  clients that hold the chat. Neither is exhaustive: stock does not say why, and its other subscribers are unknown. */
-async function cwdDiagnostics(gateway: Gateway, threadId: string): Promise<string> {
-  const warnings = gateway.messages
-    .filter((message) => ["warning", "configWarning", "guardianWarning"].includes(String(message.method))
-      && (message.params?.threadId === undefined || message.params.threadId === threadId))
-    .map((message) => `${message.method}: ${message.params?.message ?? message.params?.summary ?? ""}`.trim());
-  let holders: string;
+const WARNING_METHODS = new Set(["warning", "configWarning", "guardianWarning"]);
+const WARNING_LIMIT = 3;
+const WARNING_CHARS = 160;
+const HOLDERS_WAIT_MS = 5_000;
+
+/** A bounded, single-line excerpt with the home directory shortened: diagnostics, not a transcript. */
+function excerpt(text: unknown, chars = WARNING_CHARS): string {
+  const flat = String(text ?? "").replace(/[\u0000-\u001f\u007f]+/gu, " ").replaceAll(homedir(), "~").trim();
+  return flat.length > chars ? `${flat.slice(0, chars)}…` : flat;
+}
+
+/** Warnings stock sent for this chat after `from` (the resume): only those naming the chat count; others are counted. */
+export function resumeWarnings(messages: Message[], threadId: string, from: number): string {
+  const warnings = messages.slice(from).filter((message) => WARNING_METHODS.has(String(message.method)));
+  const own = warnings.filter((message) => message.params?.threadId === threadId);
+  const unattributed = warnings.length - own.length;
+  const shown = own.slice(0, WARNING_LIMIT)
+    .map((message) => `${message.method}: ${excerpt(message.params?.message ?? message.params?.summary)}`);
+  const more = own.length > WARNING_LIMIT ? ` (+${own.length - WARNING_LIMIT} more)` : "";
+  const others = unattributed ? `; ${unattributed} warning(s) without this chat's id, not attributed to it` : "";
+  return `warning excerpts for this chat after the resume: ${shown.length ? shown.join(" | ") : "none"}${more}${others}`;
+}
+
+export type HoldersOutcome =
+  | { outcome: "ok"; connections: Array<{ clientName: string | null; openedAt: string | null }> }
+  | { outcome: "unsupported" | "timeout" | "closed" | "malformed" | "error"; detail: string };
+
+/** The gateway's connected clients holding a stock chat, read-only (no resume, turn or unsubscribe). Failures are
+ *  told apart only as far as the answer shows: an explicit method-not-found, no answer in time, a closed
+ *  connection, an answer of the wrong shape, or another error (its code and a bounded message, cause unknown). */
+export async function queryHolders(gateway: Gateway, threadId: string, waitMs = HOLDERS_WAIT_MS): Promise<HoldersOutcome> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error("no answer"), { kind: "timeout" })), waitMs);
+  });
   try {
-    const found: Message = await gateway.request("ccodex/thread/holders", { threadId });
-    const others = (found.connections ?? []).filter((holder: Message) => !holder.self);
-    holders = `gateway clients holding the chat: ${others.length ? others.map((holder: Message) => `${holder.clientName ?? "unnamed"} (connected ${holder.openedAt})`).join(", ") : "none"} (subscribers outside the gateway are not visible)`;
-  } catch {
-    holders = "gateway clients holding the chat: unknown (this gateway has no ccodex/thread/holders)";
+    const found: Message = await Promise.race([gateway.request("ccodex/thread/holders", { threadId }), timeout]);
+    if (!found || !Array.isArray(found.connections)) return { outcome: "malformed", detail: excerpt(JSON.stringify(found ?? null)) };
+    return {
+      outcome: "ok",
+      connections: found.connections.filter((holder: Message) => holder && !holder.self)
+        .map((holder: Message) => ({ clientName: typeof holder.clientName === "string" ? holder.clientName : null, openedAt: typeof holder.openedAt === "string" ? holder.openedAt : null })),
+    };
+  } catch (error: any) {
+    if (error?.kind === "timeout") return { outcome: "timeout", detail: `no answer within ${waitMs} ms` };
+    if (gateway.isClosed()) return { outcome: "closed", detail: "the gateway closed the connection" };
+    if (error?.code === -32601) return { outcome: "unsupported", detail: "method not found" };
+    return { outcome: "error", detail: `code ${error?.code ?? "none"}: ${excerpt(error?.message)}` };
+  } finally {
+    clearTimeout(timer);
   }
-  return `Stock warnings during the resume: ${warnings.length ? warnings.join("; ") : "none"}. ${holders}.`;
+}
+
+export function describeHolders(found: HoldersOutcome): string {
+  if (found.outcome === "ok") {
+    const names = found.connections.map((holder) => `${holder.clientName ?? "unnamed"} (connected ${holder.openedAt ?? "unknown"})`);
+    return `gateway clients holding the chat: ${names.length ? names.join(", ") : "none known to the gateway"} (subscribers outside the gateway are not visible)`;
+  }
+  return `gateway clients holding the chat: not known (${found.outcome}: ${found.detail})`;
+}
+
+/** A chat given as a thread id or a title (the ✳️ mark ignored; of several chats of the title, the one used last). */
+async function resolveChat(request: Gateway["request"], chat: string): Promise<string> {
+  let threadId = chat.trim();
+  if (!UUID.test(threadId)) {
+    const wanted = threadId.replace(MARK, "").toLowerCase();
+    const found = ((await request("thread/list", { searchTerm: threadId.replace(MARK, ""), limit: 50 })).data ?? [])
+      .filter((thread: Message) => String(thread.name ?? "").replace(MARK, "").toLowerCase() === wanted);
+    if (!found.length) throw new GatewayUnavailable(`No chat is titled "${chat}".`);
+    // Old copies keep a role's title (a chat from before CCodex, an earlier chat of the role): the one used last is the role's.
+    threadId = found.sort((left: Message, right: Message) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))[0].id;
+  }
+  return threadId;
+}
+
+/**
+ * Read-only diagnostics of a chat through the gateway: its stored cwd, status and model (`thread/read` without turns),
+ * whether it is loaded, and the gateway's connected clients holding it. Nothing resumes, starts, steers or unsubscribes
+ * the chat. Stock's own subscribers outside the gateway are not visible, and why stock keeps a directory is not known.
+ */
+export async function holdersViaGateway(socketPath: string, chat: string, waitMs = HOLDERS_WAIT_MS): Promise<Message> {
+  const gateway = await connectGateway(socketPath);
+  try {
+    const threadId = await resolveChat(gateway.request, chat);
+    const read: Message = await gateway.request("thread/read", { threadId, includeTurns: false });
+    const loaded: Message = await gateway.request("thread/loaded/list", {});
+    const holders = await queryHolders(gateway, threadId, waitMs);
+    return {
+      threadId,
+      cwd: read.thread?.cwd ?? null,
+      status: read.thread?.status?.type ?? null,
+      model: read.thread?.model ?? null,
+      loaded: Array.isArray(loaded.data) ? loaded.data.includes(threadId) : null,
+      holders,
+      scope: "Only the gateway's own connected clients are visible; stock's other subscribers and its reasons for keeping a directory are not.",
+    };
+  } finally {
+    gateway.close();
+  }
+}
+
+/** What can be told about a kept cwd without changing anything: neither part is exhaustive, and stock does not say why. */
+async function cwdDiagnostics(gateway: Gateway, threadId: string, from: number): Promise<string> {
+  return `${resumeWarnings(gateway.messages, threadId, from)}. ${describeHolders(await queryHolders(gateway, threadId))}.`;
 }
 
 function sameDir(actual: unknown, wanted: string): boolean {
@@ -191,22 +275,21 @@ function sameDir(actual: unknown, wanted: string): boolean {
   return real(actual) === real(wanted);
 }
 
+/**
+ * Sends a prompt to a chat through CCodex's own socket, as the Codex app does: a chat the app has open (it has an
+ * active writer, which `codex exec resume` cannot take), a busy chat (the prompt joins its running turn) and a chat
+ * now on a Claude model (the gateway routes it to the Claude session) all get it. `chat` is a thread id or a title.
+ */
 export async function replyViaGateway(socketPath: string, chat: string, prompt: string, waitMs = REPLY_WAIT_MS,
   options: { cwd?: string } = {}): Promise<{ threadId: string; content: string }> {
   const gateway = await connectGateway(socketPath);
   const { request } = gateway;
   try {
-    let threadId = chat.trim();
-    if (!UUID.test(threadId)) {
-      const wanted = threadId.replace(MARK, "").toLowerCase();
-      const found = ((await request("thread/list", { searchTerm: threadId.replace(MARK, ""), limit: 50 })).data ?? [])
-        .filter((thread: Message) => String(thread.name ?? "").replace(MARK, "").toLowerCase() === wanted);
-      if (!found.length) throw new GatewayUnavailable(`No chat is titled "${chat}".`);
-      // Old copies keep a role's title (a chat from before CCodex, an earlier chat of the role): the one used last is the role's.
-      threadId = found.sort((left: Message, right: Message) => Number(right.updatedAt ?? 0) - Number(left.updatedAt ?? 0))[0].id;
-    }
+    const threadId = await resolveChat(request, chat);
     let resumed: Message;
+    let from = 0;
     try {
+      from = gateway.messages.length;
       resumed = await request("thread/resume", { threadId, excludeTurns: true, ...(options.cwd ? { cwd: options.cwd } : {}) });
     } catch (error) {
       throw new GatewayUnavailable(error instanceof Error ? error.message : String(error));
@@ -217,7 +300,7 @@ export async function replyViaGateway(socketPath: string, chat: string, prompt: 
     if (options.cwd && !sameDir(resumed.cwd ?? resumed.thread?.cwd, options.cwd)) {
       const kept = resumed.cwd ?? resumed.thread?.cwd ?? "its own directory";
       const facts = `[CCodex: requested cwd ${options.cwd}; chat reports cwd ${kept}; model ${resumed.model ?? "unknown"}; status ${resumed.thread?.status?.type ?? "unknown"}.`
-        + ` ${await cwdDiagnostics(gateway, threadId)}]`;
+        + ` ${await cwdDiagnostics(gateway, threadId, from)}]`;
       throw new Error(String(resumed.model ?? "").startsWith("claude")
         ? `Not sent: Claude chats cannot move to another directory, so the chat stays in ${kept}. ${facts}`
         // Observed, not exhaustive: a client still subscribed to the chat makes stock keep its directory; stock's reasons

@@ -4,7 +4,7 @@ import type { Readable, Writable } from "node:stream";
 import type { Config } from "../config.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { GatewayUnavailable, archiveViaGateway, claudeModelId, replyViaGateway, startViaGateway } from "./gatewayReply.js";
+import { GatewayUnavailable, archiveViaGateway, claudeModelId, holdersViaGateway, replyViaGateway, startViaGateway } from "./gatewayReply.js";
 import { claimOrphanedSubagentChats, forgetSubagentChat, recordSubagentChat } from "./subagentRegistry.js";
 
 /** Written into each session's rollout (`thread_source`), so CCodex's streaming can find the journal of a call. */
@@ -51,6 +51,12 @@ const TOOLS = [
       },
     },
     outputSchema: RESULT_SCHEMA,
+  },
+  {
+    name: "codex-chat-holders",
+    title: "Codex Chat Holders",
+    description: "Read-only diagnostics of a chat (thread id or title): its stored working directory, status and model, whether it is loaded, and which of the CCodex gateway's connected clients hold it. It does not resume, message or release the chat. Clients outside the gateway are not visible, and it cannot tell why a new cwd was not applied.",
+    inputSchema: { type: "object", required: ["threadId"], properties: { threadId: { type: "string", description: "The chat's thread id or title." } } },
   },
 ];
 
@@ -116,6 +122,18 @@ export function publicChatId(dataDir: string, chat: string): string {
   try { lineages = (JSON.parse(readFileSync(join(dataDir, "meta.json"), "utf8")) as { lineages?: typeof lineages }).lineages ?? {}; } catch { return chat; }
   if (chat in lineages) return chat;
   return Object.entries(lineages).find(([, segments]) => segments.some((segment) => segment.threadId === chat))?.[0] ?? chat;
+}
+
+/** `codex-chat-holders`: read-only, so a gateway that cannot answer is an error, never a fallback. */
+async function holdersThroughGateway(config: Config, args: Args): Promise<unknown> {
+  const chat = publicChatId(config.dataDir, String(args.threadId ?? "").trim());
+  try {
+    const found = await holdersViaGateway(config.publicSocket, chat);
+    return { content: [{ type: "text", text: JSON.stringify(found, null, 2) }], structuredContent: found };
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error);
+    return { content: [{ type: "text", text }], isError: true };
+  }
 }
 
 /**
@@ -197,7 +215,8 @@ export async function runMcpServer(config: Config, version: string, input: Reada
       send({ id, result: { tools: TOOLS } });
     } else if (method === "tools/call" && TOOLS.some((tool) => tool.name === params?.name)) {
       const claude = params.name === "codex" ? claudeModelId(params.arguments?.model) : undefined;
-      void (params.name === "codex-reply" ? replyThroughGateway(config, params.arguments ?? {}, children, id)
+      void (params.name === "codex-chat-holders" ? holdersThroughGateway(config, params.arguments ?? {})
+        : params.name === "codex-reply" ? replyThroughGateway(config, params.arguments ?? {}, children, id)
         : claude ? startOnClaude(config, params.arguments ?? {}, claude, (claudeCalls.set(id, new AbortController()), claudeCalls.get(id)!.signal))
         : runCall(config, params.name, params.arguments ?? {}, children, id))
         .then((result) => { claudeCalls.delete(id); send({ id, result }); });
